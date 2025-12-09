@@ -1,0 +1,423 @@
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { Download, Shuffle, Type, Activity, Share2, Grid, Monitor, Box, Sliders } from 'lucide-react';
+
+// --- Utility Functions ---
+
+const toRad = (deg) => (deg * Math.PI) / 180;
+
+// Canvas-based Text Sampler
+// Renders text to an offscreen canvas and reads pixel data to find coordinates
+const getTextPoints = (text, resolution, fontFamily = 'Inter, sans-serif') => {
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  
+  // Setup canvas size (High res for better sampling)
+  const width = 1000;
+  const height = 1000;
+  canvas.width = width;
+  canvas.height = height;
+
+  // 1. Dynamic Font Sizing Logic
+  // Start with a large font size (relative to canvas)
+  let fontSize = 600; 
+  ctx.font = `900 ${fontSize}px ${fontFamily}`;
+  
+  // Measure text
+  let textMetrics = ctx.measureText(text);
+  let textWidth = textMetrics.width;
+  
+  // Define constraints (e.g., 85% of canvas width)
+  const maxWidth = width * 0.85;
+  
+  // If text is too wide, scale down the font size
+  if (textWidth > maxWidth) {
+    const scaleFactor = maxWidth / textWidth;
+    fontSize = Math.floor(fontSize * scaleFactor);
+  }
+
+  // Draw Text
+  ctx.fillStyle = 'black';
+  ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = 'white';
+  ctx.font = `900 ${fontSize}px ${fontFamily}`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, width / 2, height / 2);
+
+  const points = [];
+  // Scan pixels
+  // We skip pixels based on 'resolution' (higher res = smaller skip)
+  // Step needs to be larger for lower resolution (less points)
+  // Logic: Resolution 1-10. Step 24 down to 4.
+  const step = Math.max(4, Math.floor(26 - resolution * 2.2)); 
+
+  const imgData = ctx.getImageData(0, 0, width, height);
+  const data = imgData.data;
+
+  for (let y = 0; y < height; y += step) {
+    for (let x = 0; x < width; x += step) {
+      const index = (y * width + x) * 4;
+      // If pixel is bright (white text)
+      if (data[index] > 128) {
+        // Center the points around 0,0
+        points.push({ x: x - width/2, y: y - height/2 });
+      }
+    }
+  }
+  return points;
+};
+
+// Intersection Logic (Optimized for performance)
+// Only checks neighbors within a certain range to avoid N^2 on large text
+const getIntersections = (circles) => {
+  const points = [];
+  // Brute force is okay for < 300 points. 
+  // If > 300, we might throttle.
+  const limit = circles.length > 500 ? 500 : circles.length;
+
+  for (let i = 0; i < limit; i++) {
+    for (let j = i + 1; j < limit; j++) {
+      const c1 = circles[i];
+      const c2 = circles[j];
+      
+      const dx = c2.x - c1.x;
+      const dy = c2.y - c1.y;
+      const distSq = dx*dx + dy*dy;
+      const rSum = c1.r + c2.r;
+      
+      // Quickbounding box check
+      if (Math.abs(dx) > rSum || Math.abs(dy) > rSum) continue;
+
+      const d = Math.sqrt(distSq);
+
+      if (d > rSum || d < Math.abs(c1.r - c2.r) || d === 0) continue;
+
+      const a = (c1.r * c1.r - c2.r * c2.r + d * d) / (2 * d);
+      const h = Math.sqrt(Math.max(0, c1.r * c1.r - a * a));
+      
+      const x2 = c1.x + a * (dx / d);
+      const y2 = c1.y + a * (dy / d);
+
+      points.push({ x: x2 + h * (dy / d), y: y2 - h * (dx / d) });
+      points.push({ x: x2 - h * (dy / d), y: y2 + h * (dx / d) });
+    }
+  }
+  return points;
+};
+
+
+// --- Components ---
+
+const ControlGroup = ({ title, children, icon: Icon }) => (
+  <div className="mb-6 border-b border-gray-800 pb-4 last:border-0">
+    <div className="flex items-center space-x-2 mb-3 text-gray-500">
+      {Icon && <Icon size={14} />}
+      <h3 className="text-[10px] font-bold uppercase tracking-widest">{title}</h3>
+    </div>
+    <div className="space-y-3">
+      {children}
+    </div>
+  </div>
+);
+
+const Slider = ({ label, value, min, max, step, onChange }) => (
+  <div className="flex flex-col space-y-1">
+    <div className="flex justify-between text-[10px] text-gray-400 font-mono uppercase">
+      <span>{label}</span>
+      <span>{value.toFixed(1)}</span>
+    </div>
+    <input
+      type="range"
+      min={min}
+      max={max}
+      step={step}
+      value={value}
+      onChange={(e) => onChange(parseFloat(e.target.value))}
+      className="w-full h-1 bg-gray-800 rounded-lg appearance-none cursor-pointer accent-white hover:accent-gray-300 focus:outline-none focus:ring-1 focus:ring-gray-500"
+    />
+  </div>
+);
+
+const App = () => {
+  // --- State ---
+  const [size, setSize] = useState(800);
+  const [text, setText] = useState("ORBIT");
+  const [fontFamily, setFontFamily] = useState("Inter, sans-serif"); // New state for font
+  const [resolution, setResolution] = useState(4); // 1 to 10
+  const [sphereRadius, setSphereRadius] = useState(30);
+  const [viewTilt, setViewTilt] = useState(0); 
+  
+  // Visual Toggles
+  const [showSpheres, setShowSpheres] = useState(true);
+  const [showConnections, setShowConnections] = useState(false);
+  const [showIntersections, setShowIntersections] = useState(true);
+  
+  // Style Params
+  const [connectionDist, setConnectionDist] = useState(40);
+  const [opacity, setOpacity] = useState(0.5);
+
+  const svgRef = useRef(null);
+
+  // --- Derived Data ---
+  
+  // 1. Generate Base Points from Text
+  const textPoints = useMemo(() => {
+    // Pass resolution and font family
+    return getTextPoints(text, resolution, fontFamily);
+  }, [text, resolution, fontFamily]);
+
+  // 2. Projection Logic
+  const project = (x, y) => {
+    const centerY = 0; // Relative to center of group
+    const scaleY = Math.cos(toRad(viewTilt));
+    return {
+      x: x,
+      y: y * scaleY,
+      scaleY: scaleY
+    };
+  };
+
+  // 3. Generate Scene Data (Projected)
+  const sceneData = useMemo(() => {
+    // Convert textPoints to circle objects
+    const circles = textPoints.map((p, i) => ({
+      id: i,
+      x: p.x, // Already centered
+      y: p.y,
+      r: sphereRadius
+    }));
+
+    // Calculate Intersections (Only if needed, heavy op)
+    let intersections = [];
+    if (showIntersections && circles.length < 600) {
+      intersections = getIntersections(circles);
+    }
+
+    // Calculate Connections (Network)
+    let connections = [];
+    if (showConnections) {
+      // Simple distance check
+      for (let i = 0; i < circles.length; i++) {
+        // Optimization: check only next few? No, spatial index is best but complex.
+        // Brute force with small limit
+        const limit = 50; // Check 50 neighbors max
+        for (let j = i + 1; j < Math.min(circles.length, i + limit); j++) {
+             const dx = circles[i].x - circles[j].x;
+             const dy = circles[i].y - circles[j].y;
+             if (Math.abs(dx) > connectionDist || Math.abs(dy) > connectionDist) continue;
+             const d = Math.sqrt(dx*dx + dy*dy);
+             if (d < connectionDist) {
+               connections.push({ x1: circles[i].x, y1: circles[i].y, x2: circles[j].x, y2: circles[j].y });
+             }
+        }
+      }
+    }
+
+    return { circles, intersections, connections };
+  }, [textPoints, sphereRadius, showIntersections, showConnections, connectionDist]);
+
+
+  const downloadSVG = () => {
+    if (!svgRef.current) return;
+    const svgData = new XMLSerializer().serializeToString(svgRef.current);
+    const blob = new Blob([svgData], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `typo-orbital-${text}.svg`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const toggleView = () => {
+    setViewTilt(viewTilt === 0 ? 90 : 0);
+  };
+
+  return (
+    <div className="flex flex-col md:flex-row h-screen bg-black text-gray-300 font-sans overflow-hidden">
+      
+      {/* Sidebar */}
+      <div className="w-full md:w-80 flex flex-col bg-[#0a0a0a] border-r border-gray-800 z-10 h-1/2 md:h-full overflow-hidden">
+        
+        <div className="p-5 border-b border-gray-800 bg-[#0a0a0a]">
+          <div className="flex items-center justify-between mb-1">
+            <h1 className="text-lg font-light tracking-[0.2em] text-white uppercase">Typo.Orbital</h1>
+            <div className="flex space-x-1">
+              <button onClick={downloadSVG} className="p-2 hover:bg-gray-800 rounded transition-colors" title="Export SVG">
+                <Download size={14} className="text-gray-400 hover:text-white" />
+              </button>
+            </div>
+          </div>
+          <p className="text-[9px] text-gray-600 font-mono uppercase tracking-widest">Parametric Typography</p>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-5 custom-scrollbar">
+          
+          <ControlGroup title="Input" icon={Type}>
+            <input 
+              type="text" 
+              value={text} 
+              onChange={(e) => setText(e.target.value.toUpperCase())}
+              maxLength={12}
+              className="w-full bg-gray-900 border border-gray-700 text-white text-sm p-2 rounded mb-2 font-mono text-center tracking-widest uppercase focus:outline-none focus:border-white"
+            />
+            
+            {/* Font Family Input */}
+            <div className="mb-4">
+              <label className="text-[10px] text-gray-500 font-mono uppercase block mb-1">Typeface</label>
+              <input 
+                type="text" 
+                value={fontFamily} 
+                onChange={(e) => setFontFamily(e.target.value)}
+                placeholder="e.g. Arial, Helvetica"
+                className="w-full bg-gray-900 border border-gray-700 text-white text-xs p-2 rounded focus:outline-none focus:border-white placeholder-gray-600"
+              />
+            </div>
+
+            <Slider 
+              label="Sampling Density" 
+              value={resolution} 
+              min={1} max={8} step={0.5} 
+              onChange={setResolution} 
+            />
+            <div className="text-[9px] text-gray-600 text-right pt-1">Points: {textPoints.length}</div>
+          </ControlGroup>
+
+          <ControlGroup title="Structure" icon={Sliders}>
+             <Slider 
+              label="Sphere Radius" 
+              value={sphereRadius} 
+              min={5} max={100} step={1} 
+              onChange={setSphereRadius} 
+            />
+             <Slider 
+              label="Opacity" 
+              value={opacity} 
+              min={0.1} max={1} step={0.1} 
+              onChange={setOpacity} 
+            />
+          </ControlGroup>
+
+          <ControlGroup title="Connections" icon={Share2}>
+             <div className="flex space-x-2 mb-3">
+               <button 
+                onClick={() => setShowConnections(!showConnections)}
+                className={`flex-1 py-1 text-[10px] uppercase font-bold border rounded ${showConnections ? 'bg-white text-black border-white' : 'border-gray-700 text-gray-500'}`}
+               >
+                 Lines
+               </button>
+               <button 
+                onClick={() => setShowIntersections(!showIntersections)}
+                className={`flex-1 py-1 text-[10px] uppercase font-bold border rounded ${showIntersections ? 'bg-white text-black border-white' : 'border-gray-700 text-gray-500'}`}
+               >
+                 Intersects
+               </button>
+             </div>
+             {showConnections && (
+               <Slider 
+                label="Link Distance" 
+                value={connectionDist} 
+                min={10} max={100} step={1} 
+                onChange={setConnectionDist} 
+              />
+             )}
+          </ControlGroup>
+
+          <ControlGroup title="View" icon={Monitor}>
+             <button 
+                 onClick={toggleView}
+                 className="flex items-center space-x-2 text-[10px] uppercase font-bold bg-gray-800 hover:bg-gray-700 px-3 py-2 rounded w-full justify-center transition-colors mb-3"
+               >
+                 {viewTilt === 0 ? <Box size={12}/> : <Activity size={12}/>}
+                 <span>{viewTilt === 0 ? "Switch to Lateral" : "Switch to Front"}</span>
+               </button>
+             <Slider 
+              label="Tilt Angle" 
+              value={viewTilt} 
+              min={0} max={90} step={1} 
+              onChange={setViewTilt} 
+            />
+          </ControlGroup>
+
+        </div>
+      </div>
+
+      {/* Main Canvas */}
+      <div className="flex-1 bg-black relative flex items-center justify-center p-4 md:p-10 h-1/2 md:h-full overflow-hidden">
+        <div className="relative shadow-2xl bg-black border border-gray-900" style={{ width: 'min(100%, 650px)', aspectRatio: '1/1' }}>
+          <svg
+            ref={svgRef}
+            viewBox={`0 0 ${size} ${size}`}
+            className="w-full h-full"
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            <rect width={size} height={size} fill="black" />
+            
+            {/* Center Group */}
+            <g transform={`translate(${size/2}, ${size/2})`}>
+              
+              {/* 1. Connections (Lines) */}
+              {showConnections && sceneData.connections.map((line, i) => {
+                const p1 = project(line.x1, line.y1);
+                const p2 = project(line.x2, line.y2);
+                return (
+                  <line 
+                    key={`l-${i}`}
+                    x1={p1.x} y1={p1.y}
+                    x2={p2.x} y2={p2.y}
+                    stroke="white"
+                    strokeWidth={0.5}
+                    opacity={0.3}
+                  />
+                );
+              })}
+
+              {/* 2. Spheres (Ellipses when tilted) */}
+              {showSpheres && sceneData.circles.map((c) => {
+                const p = project(c.x, c.y);
+                return (
+                  <ellipse
+                    key={`c-${c.id}`}
+                    cx={p.x}
+                    cy={p.y}
+                    rx={c.r}
+                    ry={c.r * p.scaleY}
+                    fill="none"
+                    stroke="white"
+                    strokeWidth={0.5}
+                    opacity={opacity}
+                  />
+                );
+              })}
+
+              {/* 3. Intersection Dots */}
+              {showIntersections && sceneData.intersections.map((pt, i) => {
+                 const p = project(pt.x, pt.y);
+                 return (
+                   <circle
+                    key={`i-${i}`}
+                    cx={p.x}
+                    cy={p.y}
+                    r={1.5}
+                    fill="white"
+                    opacity={0.8}
+                   />
+                 );
+              })}
+
+            </g>
+          </svg>
+        </div>
+        
+        <div className="absolute bottom-6 left-10 text-[10px] text-gray-600 uppercase tracking-widest pointer-events-none">
+          {text} // {resolution} // {sphereRadius}
+        </div>
+
+      </div>
+
+    </div>
+  );
+};
+
+export default App;
