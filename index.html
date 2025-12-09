@@ -1,423 +1,453 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Download, Shuffle, Type, Activity, Share2, Grid, Monitor, Box, Sliders } from 'lucide-react';
-
-// --- Utility Functions ---
-
-const toRad = (deg) => (deg * Math.PI) / 180;
-
-// Canvas-based Text Sampler
-// Renders text to an offscreen canvas and reads pixel data to find coordinates
-const getTextPoints = (text, resolution, fontFamily = 'Inter, sans-serif') => {
-  const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d');
-  
-  // Setup canvas size (High res for better sampling)
-  const width = 1000;
-  const height = 1000;
-  canvas.width = width;
-  canvas.height = height;
-
-  // 1. Dynamic Font Sizing Logic
-  // Start with a large font size (relative to canvas)
-  let fontSize = 600; 
-  ctx.font = `900 ${fontSize}px ${fontFamily}`;
-  
-  // Measure text
-  let textMetrics = ctx.measureText(text);
-  let textWidth = textMetrics.width;
-  
-  // Define constraints (e.g., 85% of canvas width)
-  const maxWidth = width * 0.85;
-  
-  // If text is too wide, scale down the font size
-  if (textWidth > maxWidth) {
-    const scaleFactor = maxWidth / textWidth;
-    fontSize = Math.floor(fontSize * scaleFactor);
-  }
-
-  // Draw Text
-  ctx.fillStyle = 'black';
-  ctx.fillRect(0, 0, width, height);
-  ctx.fillStyle = 'white';
-  ctx.font = `900 ${fontSize}px ${fontFamily}`;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(text, width / 2, height / 2);
-
-  const points = [];
-  // Scan pixels
-  // We skip pixels based on 'resolution' (higher res = smaller skip)
-  // Step needs to be larger for lower resolution (less points)
-  // Logic: Resolution 1-10. Step 24 down to 4.
-  const step = Math.max(4, Math.floor(26 - resolution * 2.2)); 
-
-  const imgData = ctx.getImageData(0, 0, width, height);
-  const data = imgData.data;
-
-  for (let y = 0; y < height; y += step) {
-    for (let x = 0; x < width; x += step) {
-      const index = (y * width + x) * 4;
-      // If pixel is bright (white text)
-      if (data[index] > 128) {
-        // Center the points around 0,0
-        points.push({ x: x - width/2, y: y - height/2 });
-      }
-    }
-  }
-  return points;
-};
-
-// Intersection Logic (Optimized for performance)
-// Only checks neighbors within a certain range to avoid N^2 on large text
-const getIntersections = (circles) => {
-  const points = [];
-  // Brute force is okay for < 300 points. 
-  // If > 300, we might throttle.
-  const limit = circles.length > 500 ? 500 : circles.length;
-
-  for (let i = 0; i < limit; i++) {
-    for (let j = i + 1; j < limit; j++) {
-      const c1 = circles[i];
-      const c2 = circles[j];
-      
-      const dx = c2.x - c1.x;
-      const dy = c2.y - c1.y;
-      const distSq = dx*dx + dy*dy;
-      const rSum = c1.r + c2.r;
-      
-      // Quickbounding box check
-      if (Math.abs(dx) > rSum || Math.abs(dy) > rSum) continue;
-
-      const d = Math.sqrt(distSq);
-
-      if (d > rSum || d < Math.abs(c1.r - c2.r) || d === 0) continue;
-
-      const a = (c1.r * c1.r - c2.r * c2.r + d * d) / (2 * d);
-      const h = Math.sqrt(Math.max(0, c1.r * c1.r - a * a));
-      
-      const x2 = c1.x + a * (dx / d);
-      const y2 = c1.y + a * (dy / d);
-
-      points.push({ x: x2 + h * (dy / d), y: y2 - h * (dx / d) });
-      points.push({ x: x2 - h * (dy / d), y: y2 + h * (dx / d) });
-    }
-  }
-  return points;
-};
-
-
-// --- Components ---
-
-const ControlGroup = ({ title, children, icon: Icon }) => (
-  <div className="mb-6 border-b border-gray-800 pb-4 last:border-0">
-    <div className="flex items-center space-x-2 mb-3 text-gray-500">
-      {Icon && <Icon size={14} />}
-      <h3 className="text-[10px] font-bold uppercase tracking-widest">{title}</h3>
-    </div>
-    <div className="space-y-3">
-      {children}
-    </div>
-  </div>
-);
-
-const Slider = ({ label, value, min, max, step, onChange }) => (
-  <div className="flex flex-col space-y-1">
-    <div className="flex justify-between text-[10px] text-gray-400 font-mono uppercase">
-      <span>{label}</span>
-      <span>{value.toFixed(1)}</span>
-    </div>
-    <input
-      type="range"
-      min={min}
-      max={max}
-      step={step}
-      value={value}
-      onChange={(e) => onChange(parseFloat(e.target.value))}
-      className="w-full h-1 bg-gray-800 rounded-lg appearance-none cursor-pointer accent-white hover:accent-gray-300 focus:outline-none focus:ring-1 focus:ring-gray-500"
-    />
-  </div>
-);
-
-const App = () => {
-  // --- State ---
-  const [size, setSize] = useState(800);
-  const [text, setText] = useState("ORBIT");
-  const [fontFamily, setFontFamily] = useState("Inter, sans-serif"); // New state for font
-  const [resolution, setResolution] = useState(4); // 1 to 10
-  const [sphereRadius, setSphereRadius] = useState(30);
-  const [viewTilt, setViewTilt] = useState(0); 
-  
-  // Visual Toggles
-  const [showSpheres, setShowSpheres] = useState(true);
-  const [showConnections, setShowConnections] = useState(false);
-  const [showIntersections, setShowIntersections] = useState(true);
-  
-  // Style Params
-  const [connectionDist, setConnectionDist] = useState(40);
-  const [opacity, setOpacity] = useState(0.5);
-
-  const svgRef = useRef(null);
-
-  // --- Derived Data ---
-  
-  // 1. Generate Base Points from Text
-  const textPoints = useMemo(() => {
-    // Pass resolution and font family
-    return getTextPoints(text, resolution, fontFamily);
-  }, [text, resolution, fontFamily]);
-
-  // 2. Projection Logic
-  const project = (x, y) => {
-    const centerY = 0; // Relative to center of group
-    const scaleY = Math.cos(toRad(viewTilt));
-    return {
-      x: x,
-      y: y * scaleY,
-      scaleY: scaleY
-    };
-  };
-
-  // 3. Generate Scene Data (Projected)
-  const sceneData = useMemo(() => {
-    // Convert textPoints to circle objects
-    const circles = textPoints.map((p, i) => ({
-      id: i,
-      x: p.x, // Already centered
-      y: p.y,
-      r: sphereRadius
-    }));
-
-    // Calculate Intersections (Only if needed, heavy op)
-    let intersections = [];
-    if (showIntersections && circles.length < 600) {
-      intersections = getIntersections(circles);
-    }
-
-    // Calculate Connections (Network)
-    let connections = [];
-    if (showConnections) {
-      // Simple distance check
-      for (let i = 0; i < circles.length; i++) {
-        // Optimization: check only next few? No, spatial index is best but complex.
-        // Brute force with small limit
-        const limit = 50; // Check 50 neighbors max
-        for (let j = i + 1; j < Math.min(circles.length, i + limit); j++) {
-             const dx = circles[i].x - circles[j].x;
-             const dy = circles[i].y - circles[j].y;
-             if (Math.abs(dx) > connectionDist || Math.abs(dy) > connectionDist) continue;
-             const d = Math.sqrt(dx*dx + dy*dy);
-             if (d < connectionDist) {
-               connections.push({ x1: circles[i].x, y1: circles[i].y, x2: circles[j].x, y2: circles[j].y });
-             }
-        }
-      }
-    }
-
-    return { circles, intersections, connections };
-  }, [textPoints, sphereRadius, showIntersections, showConnections, connectionDist]);
-
-
-  const downloadSVG = () => {
-    if (!svgRef.current) return;
-    const svgData = new XMLSerializer().serializeToString(svgRef.current);
-    const blob = new Blob([svgData], { type: 'image/svg+xml;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `typo-orbital-${text}.svg`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  };
-
-  const toggleView = () => {
-    setViewTilt(viewTilt === 0 ? 90 : 0);
-  };
-
-  return (
-    <div className="flex flex-col md:flex-row h-screen bg-black text-gray-300 font-sans overflow-hidden">
-      
-      {/* Sidebar */}
-      <div className="w-full md:w-80 flex flex-col bg-[#0a0a0a] border-r border-gray-800 z-10 h-1/2 md:h-full overflow-hidden">
-        
-        <div className="p-5 border-b border-gray-800 bg-[#0a0a0a]">
-          <div className="flex items-center justify-between mb-1">
-            <h1 className="text-lg font-light tracking-[0.2em] text-white uppercase">Typo.Orbital</h1>
-            <div className="flex space-x-1">
-              <button onClick={downloadSVG} className="p-2 hover:bg-gray-800 rounded transition-colors" title="Export SVG">
-                <Download size={14} className="text-gray-400 hover:text-white" />
-              </button>
-            </div>
-          </div>
-          <p className="text-[9px] text-gray-600 font-mono uppercase tracking-widest">Parametric Typography</p>
-        </div>
-
-        <div className="flex-1 overflow-y-auto p-5 custom-scrollbar">
-          
-          <ControlGroup title="Input" icon={Type}>
-            <input 
-              type="text" 
-              value={text} 
-              onChange={(e) => setText(e.target.value.toUpperCase())}
-              maxLength={12}
-              className="w-full bg-gray-900 border border-gray-700 text-white text-sm p-2 rounded mb-2 font-mono text-center tracking-widest uppercase focus:outline-none focus:border-white"
-            />
-            
-            {/* Font Family Input */}
-            <div className="mb-4">
-              <label className="text-[10px] text-gray-500 font-mono uppercase block mb-1">Typeface</label>
-              <input 
-                type="text" 
-                value={fontFamily} 
-                onChange={(e) => setFontFamily(e.target.value)}
-                placeholder="e.g. Arial, Helvetica"
-                className="w-full bg-gray-900 border border-gray-700 text-white text-xs p-2 rounded focus:outline-none focus:border-white placeholder-gray-600"
-              />
-            </div>
-
-            <Slider 
-              label="Sampling Density" 
-              value={resolution} 
-              min={1} max={8} step={0.5} 
-              onChange={setResolution} 
-            />
-            <div className="text-[9px] text-gray-600 text-right pt-1">Points: {textPoints.length}</div>
-          </ControlGroup>
-
-          <ControlGroup title="Structure" icon={Sliders}>
-             <Slider 
-              label="Sphere Radius" 
-              value={sphereRadius} 
-              min={5} max={100} step={1} 
-              onChange={setSphereRadius} 
-            />
-             <Slider 
-              label="Opacity" 
-              value={opacity} 
-              min={0.1} max={1} step={0.1} 
-              onChange={setOpacity} 
-            />
-          </ControlGroup>
-
-          <ControlGroup title="Connections" icon={Share2}>
-             <div className="flex space-x-2 mb-3">
-               <button 
-                onClick={() => setShowConnections(!showConnections)}
-                className={`flex-1 py-1 text-[10px] uppercase font-bold border rounded ${showConnections ? 'bg-white text-black border-white' : 'border-gray-700 text-gray-500'}`}
-               >
-                 Lines
-               </button>
-               <button 
-                onClick={() => setShowIntersections(!showIntersections)}
-                className={`flex-1 py-1 text-[10px] uppercase font-bold border rounded ${showIntersections ? 'bg-white text-black border-white' : 'border-gray-700 text-gray-500'}`}
-               >
-                 Intersects
-               </button>
-             </div>
-             {showConnections && (
-               <Slider 
-                label="Link Distance" 
-                value={connectionDist} 
-                min={10} max={100} step={1} 
-                onChange={setConnectionDist} 
-              />
-             )}
-          </ControlGroup>
-
-          <ControlGroup title="View" icon={Monitor}>
-             <button 
-                 onClick={toggleView}
-                 className="flex items-center space-x-2 text-[10px] uppercase font-bold bg-gray-800 hover:bg-gray-700 px-3 py-2 rounded w-full justify-center transition-colors mb-3"
-               >
-                 {viewTilt === 0 ? <Box size={12}/> : <Activity size={12}/>}
-                 <span>{viewTilt === 0 ? "Switch to Lateral" : "Switch to Front"}</span>
-               </button>
-             <Slider 
-              label="Tilt Angle" 
-              value={viewTilt} 
-              min={0} max={90} step={1} 
-              onChange={setViewTilt} 
-            />
-          </ControlGroup>
-
-        </div>
-      </div>
-
-      {/* Main Canvas */}
-      <div className="flex-1 bg-black relative flex items-center justify-center p-4 md:p-10 h-1/2 md:h-full overflow-hidden">
-        <div className="relative shadow-2xl bg-black border border-gray-900" style={{ width: 'min(100%, 650px)', aspectRatio: '1/1' }}>
-          <svg
-            ref={svgRef}
-            viewBox={`0 0 ${size} ${size}`}
-            className="w-full h-full"
-            xmlns="http://www.w3.org/2000/svg"
-          >
-            <rect width={size} height={size} fill="black" />
-            
-            {/* Center Group */}
-            <g transform={`translate(${size/2}, ${size/2})`}>
-              
-              {/* 1. Connections (Lines) */}
-              {showConnections && sceneData.connections.map((line, i) => {
-                const p1 = project(line.x1, line.y1);
-                const p2 = project(line.x2, line.y2);
-                return (
-                  <line 
-                    key={`l-${i}`}
-                    x1={p1.x} y1={p1.y}
-                    x2={p2.x} y2={p2.y}
-                    stroke="white"
-                    strokeWidth={0.5}
-                    opacity={0.3}
-                  />
-                );
-              })}
-
-              {/* 2. Spheres (Ellipses when tilted) */}
-              {showSpheres && sceneData.circles.map((c) => {
-                const p = project(c.x, c.y);
-                return (
-                  <ellipse
-                    key={`c-${c.id}`}
-                    cx={p.x}
-                    cy={p.y}
-                    rx={c.r}
-                    ry={c.r * p.scaleY}
-                    fill="none"
-                    stroke="white"
-                    strokeWidth={0.5}
-                    opacity={opacity}
-                  />
-                );
-              })}
-
-              {/* 3. Intersection Dots */}
-              {showIntersections && sceneData.intersections.map((pt, i) => {
-                 const p = project(pt.x, pt.y);
-                 return (
-                   <circle
-                    key={`i-${i}`}
-                    cx={p.x}
-                    cy={p.y}
-                    r={1.5}
-                    fill="white"
-                    opacity={0.8}
-                   />
-                 );
-              })}
-
-            </g>
-          </svg>
-        </div>
-        
-        <div className="absolute bottom-6 left-10 text-[10px] text-gray-600 uppercase tracking-widest pointer-events-none">
-          {text} // {resolution} // {sphereRadius}
-        </div>
-
-      </div>
-
-    </div>
-  );
-};
-
-export default App;
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
+<html>
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+  <meta http-equiv="Content-Style-Type" content="text/css">
+  <title></title>
+  <meta name="Generator" content="Cocoa HTML Writer">
+  <meta name="CocoaVersion" content="2575.7">
+  <style type="text/css">
+    p.p1 {margin: 0.0px 0.0px 0.0px 0.0px; font: 14.0px Menlo; color: #cacaca; -webkit-text-stroke: #cacaca}
+    p.p2 {margin: 0.0px 0.0px 0.0px 0.0px; font: 14.0px Menlo; color: #36c0a0; -webkit-text-stroke: #36c0a0}
+    p.p3 {margin: 0.0px 0.0px 0.0px 0.0px; font: 14.0px Menlo; color: #cacaca; -webkit-text-stroke: #cacaca; min-height: 16.0px}
+    p.p4 {margin: 0.0px 0.0px 0.0px 0.0px; font: 14.0px Menlo; color: #6d7378; -webkit-text-stroke: #6d7378}
+    p.p5 {margin: 0.0px 0.0px 0.0px 0.0px; font: 14.0px Menlo; color: #d4d4d4; -webkit-text-stroke: #d4d4d4}
+    p.p6 {margin: 0.0px 0.0px 0.0px 0.0px; font: 14.0px Menlo; color: #71c083; -webkit-text-stroke: #71c083}
+    p.p7 {margin: 0.0px 0.0px 0.0px 0.0px; font: 14.0px Menlo; color: #b76ff7; -webkit-text-stroke: #b76ff7}
+    span.s1 {font-kerning: none; color: #b76ff7; background-color: #171818; -webkit-text-stroke: 0px #b76ff7}
+    span.s2 {font-kerning: none; background-color: #171818}
+    span.s3 {font-kerning: none; color: #36c0a0; background-color: #171818; -webkit-text-stroke: 0px #36c0a0}
+    span.s4 {font-kerning: none; color: #d4d4d4; background-color: #171818; -webkit-text-stroke: 0px #d4d4d4}
+    span.s5 {font-kerning: none; color: #71c083; background-color: #171818; -webkit-text-stroke: 0px #71c083}
+    span.s6 {font-kerning: none; color: #cacaca; background-color: #171818; -webkit-text-stroke: 0px #cacaca}
+    span.s7 {font-kerning: none}
+    span.s8 {font-kerning: none; color: #f67c30; background-color: #171818; -webkit-text-stroke: 0px #f67c30}
+    span.s9 {font-kerning: none; color: #6d7378; background-color: #171818; -webkit-text-stroke: 0px #6d7378}
+  </style>
+</head>
+<body>
+<p class="p1"><span class="s1">import</span><span class="s2"> </span><span class="s3">React</span><span class="s4">,</span><span class="s2"> </span><span class="s4">{</span><span class="s2"> useState</span><span class="s4">,</span><span class="s2"> useEffect</span><span class="s4">,</span><span class="s2"> useRef</span><span class="s4">,</span><span class="s2"> useMemo </span><span class="s4">}</span><span class="s2"> </span><span class="s1">from</span><span class="s2"> </span><span class="s5">'react'</span><span class="s4">;</span></p>
+<p class="p2"><span class="s1">import</span><span class="s6"> </span><span class="s4">{</span><span class="s6"> </span><span class="s2">Download</span><span class="s4">,</span><span class="s6"> </span><span class="s2">Shuffle</span><span class="s4">,</span><span class="s6"> </span><span class="s2">Type</span><span class="s4">,</span><span class="s6"> </span><span class="s2">Activity</span><span class="s4">,</span><span class="s6"> </span><span class="s2">Share2</span><span class="s4">,</span><span class="s6"> </span><span class="s2">Grid</span><span class="s4">,</span><span class="s6"> </span><span class="s2">Monitor</span><span class="s4">,</span><span class="s6"> </span><span class="s2">Box</span><span class="s4">,</span><span class="s6"> </span><span class="s2">Sliders</span><span class="s6"> </span><span class="s4">}</span><span class="s6"> </span><span class="s1">from</span><span class="s6"> </span><span class="s5">'lucide-react'</span><span class="s4">;</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p4"><span class="s2">// --- Utility Functions ---</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s1">const</span><span class="s2"> toRad </span><span class="s4">=</span><span class="s2"> </span><span class="s4">(</span><span class="s2">deg</span><span class="s4">)</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> </span><span class="s4">(</span><span class="s2">deg </span><span class="s4">*</span><span class="s2"> </span><span class="s3">Math</span><span class="s4">.</span><span class="s3">PI</span><span class="s4">)</span><span class="s2"> </span><span class="s4">/</span><span class="s2"> </span><span class="s8">180</span><span class="s4">;</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p4"><span class="s2">// Canvas-based Text Sampler</span></p>
+<p class="p4"><span class="s2">// Renders text to an offscreen canvas and reads pixel data to find coordinates</span></p>
+<p class="p1"><span class="s1">const</span><span class="s2"> getTextPoints </span><span class="s4">=</span><span class="s2"> </span><span class="s4">(</span><span class="s2">text</span><span class="s4">,</span><span class="s2"> resolution</span><span class="s4">,</span><span class="s2"> fontFamily </span><span class="s4">=</span><span class="s2"> </span><span class="s5">'Inter, sans-serif'</span><span class="s4">)</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> canvas </span><span class="s4">=</span><span class="s2"> document</span><span class="s4">.</span><span class="s2">createElement</span><span class="s4">(</span><span class="s5">'canvas'</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> ctx </span><span class="s4">=</span><span class="s2"> canvas</span><span class="s4">.</span><span class="s2">getContext</span><span class="s4">(</span><span class="s5">'2d'</span><span class="s4">);</span></p>
+<p class="p3"><span class="s2"><span class="Apple-converted-space">  </span></span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// Setup canvas size (High res for better sampling)</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> width </span><span class="s4">=</span><span class="s2"> </span><span class="s8">1000</span><span class="s4">;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> height </span><span class="s4">=</span><span class="s2"> </span><span class="s8">1000</span><span class="s4">;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span>canvas</span><span class="s4">.</span><span class="s2">width </span><span class="s4">=</span><span class="s2"> width</span><span class="s4">;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span>canvas</span><span class="s4">.</span><span class="s2">height </span><span class="s4">=</span><span class="s2"> height</span><span class="s4">;</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// 1. Dynamic Font Sizing Logic</span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// Start with a large font size (relative to canvas)</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">let</span><span class="s2"> fontSize </span><span class="s4">=</span><span class="s2"> </span><span class="s8">600</span><span class="s4">;</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span>ctx</span><span class="s4">.</span><span class="s2">font </span><span class="s4">=</span><span class="s2"> </span><span class="s5">`900 </span><span class="s4">${</span><span class="s2">fontSize</span><span class="s4">}</span><span class="s5">px </span><span class="s4">${</span><span class="s2">fontFamily</span><span class="s4">}</span><span class="s5">`</span><span class="s4">;</span></p>
+<p class="p3"><span class="s2"><span class="Apple-converted-space">  </span></span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// Measure text</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">let</span><span class="s2"> textMetrics </span><span class="s4">=</span><span class="s2"> ctx</span><span class="s4">.</span><span class="s2">measureText</span><span class="s4">(</span><span class="s2">text</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">let</span><span class="s2"> textWidth </span><span class="s4">=</span><span class="s2"> textMetrics</span><span class="s4">.</span><span class="s2">width</span><span class="s4">;</span></p>
+<p class="p3"><span class="s2"><span class="Apple-converted-space">  </span></span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// Define constraints (e.g., 85% of canvas width)</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> maxWidth </span><span class="s4">=</span><span class="s2"> width </span><span class="s4">*</span><span class="s2"> </span><span class="s8">0.85</span><span class="s4">;</span></p>
+<p class="p3"><span class="s2"><span class="Apple-converted-space">  </span></span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// If text is too wide, scale down the font size</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">if</span><span class="s2"> </span><span class="s4">(</span><span class="s2">textWidth </span><span class="s4">&gt;</span><span class="s2"> maxWidth</span><span class="s4">)</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s1">const</span><span class="s2"> scaleFactor </span><span class="s4">=</span><span class="s2"> maxWidth </span><span class="s4">/</span><span class="s2"> textWidth</span><span class="s4">;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span>fontSize </span><span class="s4">=</span><span class="s2"> </span><span class="s3">Math</span><span class="s4">.</span><span class="s2">floor</span><span class="s4">(</span><span class="s2">fontSize </span><span class="s4">*</span><span class="s2"> scaleFactor</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s4">}</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// Draw Text</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span>ctx</span><span class="s4">.</span><span class="s2">fillStyle </span><span class="s4">=</span><span class="s2"> </span><span class="s5">'black'</span><span class="s4">;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span>ctx</span><span class="s4">.</span><span class="s2">fillRect</span><span class="s4">(</span><span class="s8">0</span><span class="s4">,</span><span class="s2"> </span><span class="s8">0</span><span class="s4">,</span><span class="s2"> width</span><span class="s4">,</span><span class="s2"> height</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span>ctx</span><span class="s4">.</span><span class="s2">fillStyle </span><span class="s4">=</span><span class="s2"> </span><span class="s5">'white'</span><span class="s4">;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span>ctx</span><span class="s4">.</span><span class="s2">font </span><span class="s4">=</span><span class="s2"> </span><span class="s5">`900 </span><span class="s4">${</span><span class="s2">fontSize</span><span class="s4">}</span><span class="s5">px </span><span class="s4">${</span><span class="s2">fontFamily</span><span class="s4">}</span><span class="s5">`</span><span class="s4">;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span>ctx</span><span class="s4">.</span><span class="s2">textAlign </span><span class="s4">=</span><span class="s2"> </span><span class="s5">'center'</span><span class="s4">;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span>ctx</span><span class="s4">.</span><span class="s2">textBaseline </span><span class="s4">=</span><span class="s2"> </span><span class="s5">'middle'</span><span class="s4">;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span>ctx</span><span class="s4">.</span><span class="s2">fillText</span><span class="s4">(</span><span class="s2">text</span><span class="s4">,</span><span class="s2"> width </span><span class="s4">/</span><span class="s2"> </span><span class="s8">2</span><span class="s4">,</span><span class="s2"> height </span><span class="s4">/</span><span class="s2"> </span><span class="s8">2</span><span class="s4">);</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> points </span><span class="s4">=</span><span class="s2"> </span><span class="s4">[];</span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// Scan pixels</span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// We skip pixels based on 'resolution' (higher res = smaller skip)</span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// Step needs to be larger for lower resolution (less points)</span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// Logic: Resolution 1-10. Step 24 down to 4.</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> step </span><span class="s4">=</span><span class="s2"> </span><span class="s3">Math</span><span class="s4">.</span><span class="s2">max</span><span class="s4">(</span><span class="s8">4</span><span class="s4">,</span><span class="s2"> </span><span class="s3">Math</span><span class="s4">.</span><span class="s2">floor</span><span class="s4">(</span><span class="s8">26</span><span class="s2"> </span><span class="s4">-</span><span class="s2"> resolution </span><span class="s4">*</span><span class="s2"> </span><span class="s8">2.2</span><span class="s4">));</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> imgData </span><span class="s4">=</span><span class="s2"> ctx</span><span class="s4">.</span><span class="s2">getImageData</span><span class="s4">(</span><span class="s8">0</span><span class="s4">,</span><span class="s2"> </span><span class="s8">0</span><span class="s4">,</span><span class="s2"> width</span><span class="s4">,</span><span class="s2"> height</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> data </span><span class="s4">=</span><span class="s2"> imgData</span><span class="s4">.</span><span class="s2">data</span><span class="s4">;</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">for</span><span class="s2"> </span><span class="s4">(</span><span class="s1">let</span><span class="s2"> y </span><span class="s4">=</span><span class="s2"> </span><span class="s8">0</span><span class="s4">;</span><span class="s2"> y </span><span class="s4">&lt;</span><span class="s2"> height</span><span class="s4">;</span><span class="s2"> y </span><span class="s4">+=</span><span class="s2"> step</span><span class="s4">)</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s1">for</span><span class="s2"> </span><span class="s4">(</span><span class="s1">let</span><span class="s2"> x </span><span class="s4">=</span><span class="s2"> </span><span class="s8">0</span><span class="s4">;</span><span class="s2"> x </span><span class="s4">&lt;</span><span class="s2"> width</span><span class="s4">;</span><span class="s2"> x </span><span class="s4">+=</span><span class="s2"> step</span><span class="s4">)</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s1">const</span><span class="s2"> index </span><span class="s4">=</span><span class="s2"> </span><span class="s4">(</span><span class="s2">y </span><span class="s4">*</span><span class="s2"> width </span><span class="s4">+</span><span class="s2"> x</span><span class="s4">)</span><span class="s2"> </span><span class="s4">*</span><span class="s2"> </span><span class="s8">4</span><span class="s4">;</span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">      </span></span><span class="s2">// If pixel is bright (white text)</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s1">if</span><span class="s2"> </span><span class="s4">(</span><span class="s2">data</span><span class="s4">[</span><span class="s2">index</span><span class="s4">]</span><span class="s2"> </span><span class="s4">&gt;</span><span class="s2"> </span><span class="s8">128</span><span class="s4">)</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">        </span></span><span class="s2">// Center the points around 0,0</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">        </span>points</span><span class="s4">.</span><span class="s2">push</span><span class="s4">({</span><span class="s2"> x</span><span class="s4">:</span><span class="s2"> x </span><span class="s4">-</span><span class="s2"> width</span><span class="s4">/</span><span class="s8">2</span><span class="s4">,</span><span class="s2"> y</span><span class="s4">:</span><span class="s2"> y </span><span class="s4">-</span><span class="s2"> height</span><span class="s4">/</span><span class="s8">2</span><span class="s2"> </span><span class="s4">});</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">return</span><span class="s2"> points</span><span class="s4">;</span></p>
+<p class="p5"><span class="s2">};</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p4"><span class="s2">// Intersection Logic (Optimized for performance)</span></p>
+<p class="p4"><span class="s2">// Only checks neighbors within a certain range to avoid N^2 on large text</span></p>
+<p class="p1"><span class="s1">const</span><span class="s2"> getIntersections </span><span class="s4">=</span><span class="s2"> </span><span class="s4">(</span><span class="s2">circles</span><span class="s4">)</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> points </span><span class="s4">=</span><span class="s2"> </span><span class="s4">[];</span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// Brute force is okay for &lt; 300 points.<span class="Apple-converted-space"> </span></span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// If &gt; 300, we might throttle.</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> limit </span><span class="s4">=</span><span class="s2"> circles</span><span class="s4">.</span><span class="s2">length </span><span class="s4">&gt;</span><span class="s2"> </span><span class="s8">500</span><span class="s2"> </span><span class="s4">?</span><span class="s2"> </span><span class="s8">500</span><span class="s2"> </span><span class="s4">:</span><span class="s2"> circles</span><span class="s4">.</span><span class="s2">length</span><span class="s4">;</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">for</span><span class="s2"> </span><span class="s4">(</span><span class="s1">let</span><span class="s2"> i </span><span class="s4">=</span><span class="s2"> </span><span class="s8">0</span><span class="s4">;</span><span class="s2"> i </span><span class="s4">&lt;</span><span class="s2"> limit</span><span class="s4">;</span><span class="s2"> i</span><span class="s4">++)</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s1">for</span><span class="s2"> </span><span class="s4">(</span><span class="s1">let</span><span class="s2"> j </span><span class="s4">=</span><span class="s2"> i </span><span class="s4">+</span><span class="s2"> </span><span class="s8">1</span><span class="s4">;</span><span class="s2"> j </span><span class="s4">&lt;</span><span class="s2"> limit</span><span class="s4">;</span><span class="s2"> j</span><span class="s4">++)</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s1">const</span><span class="s2"> c1 </span><span class="s4">=</span><span class="s2"> circles</span><span class="s4">[</span><span class="s2">i</span><span class="s4">];</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s1">const</span><span class="s2"> c2 </span><span class="s4">=</span><span class="s2"> circles</span><span class="s4">[</span><span class="s2">j</span><span class="s4">];</span></p>
+<p class="p3"><span class="s2"><span class="Apple-converted-space">      </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s1">const</span><span class="s2"> dx </span><span class="s4">=</span><span class="s2"> c2</span><span class="s4">.</span><span class="s2">x </span><span class="s4">-</span><span class="s2"> c1</span><span class="s4">.</span><span class="s2">x</span><span class="s4">;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s1">const</span><span class="s2"> dy </span><span class="s4">=</span><span class="s2"> c2</span><span class="s4">.</span><span class="s2">y </span><span class="s4">-</span><span class="s2"> c1</span><span class="s4">.</span><span class="s2">y</span><span class="s4">;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s1">const</span><span class="s2"> distSq </span><span class="s4">=</span><span class="s2"> dx</span><span class="s4">*</span><span class="s2">dx </span><span class="s4">+</span><span class="s2"> dy</span><span class="s4">*</span><span class="s2">dy</span><span class="s4">;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s1">const</span><span class="s2"> rSum </span><span class="s4">=</span><span class="s2"> c1</span><span class="s4">.</span><span class="s2">r </span><span class="s4">+</span><span class="s2"> c2</span><span class="s4">.</span><span class="s2">r</span><span class="s4">;</span></p>
+<p class="p3"><span class="s2"><span class="Apple-converted-space">      </span></span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">      </span></span><span class="s2">// Quickbounding box check</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s1">if</span><span class="s2"> </span><span class="s4">(</span><span class="s3">Math</span><span class="s4">.</span><span class="s2">abs</span><span class="s4">(</span><span class="s2">dx</span><span class="s4">)</span><span class="s2"> </span><span class="s4">&gt;</span><span class="s2"> rSum </span><span class="s4">||</span><span class="s2"> </span><span class="s3">Math</span><span class="s4">.</span><span class="s2">abs</span><span class="s4">(</span><span class="s2">dy</span><span class="s4">)</span><span class="s2"> </span><span class="s4">&gt;</span><span class="s2"> rSum</span><span class="s4">)</span><span class="s2"> </span><span class="s1">continue</span><span class="s4">;</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s1">const</span><span class="s2"> d </span><span class="s4">=</span><span class="s2"> </span><span class="s3">Math</span><span class="s4">.</span><span class="s2">sqrt</span><span class="s4">(</span><span class="s2">distSq</span><span class="s4">);</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s1">if</span><span class="s2"> </span><span class="s4">(</span><span class="s2">d </span><span class="s4">&gt;</span><span class="s2"> rSum </span><span class="s4">||</span><span class="s2"> d </span><span class="s4">&lt;</span><span class="s2"> </span><span class="s3">Math</span><span class="s4">.</span><span class="s2">abs</span><span class="s4">(</span><span class="s2">c1</span><span class="s4">.</span><span class="s2">r </span><span class="s4">-</span><span class="s2"> c2</span><span class="s4">.</span><span class="s2">r</span><span class="s4">)</span><span class="s2"> </span><span class="s4">||</span><span class="s2"> d </span><span class="s4">===</span><span class="s2"> </span><span class="s8">0</span><span class="s4">)</span><span class="s2"> </span><span class="s1">continue</span><span class="s4">;</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s1">const</span><span class="s2"> a </span><span class="s4">=</span><span class="s2"> </span><span class="s4">(</span><span class="s2">c1</span><span class="s4">.</span><span class="s2">r </span><span class="s4">*</span><span class="s2"> c1</span><span class="s4">.</span><span class="s2">r </span><span class="s4">-</span><span class="s2"> c2</span><span class="s4">.</span><span class="s2">r </span><span class="s4">*</span><span class="s2"> c2</span><span class="s4">.</span><span class="s2">r </span><span class="s4">+</span><span class="s2"> d </span><span class="s4">*</span><span class="s2"> d</span><span class="s4">)</span><span class="s2"> </span><span class="s4">/</span><span class="s2"> </span><span class="s4">(</span><span class="s8">2</span><span class="s2"> </span><span class="s4">*</span><span class="s2"> d</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s1">const</span><span class="s2"> h </span><span class="s4">=</span><span class="s2"> </span><span class="s3">Math</span><span class="s4">.</span><span class="s2">sqrt</span><span class="s4">(</span><span class="s3">Math</span><span class="s4">.</span><span class="s2">max</span><span class="s4">(</span><span class="s8">0</span><span class="s4">,</span><span class="s2"> c1</span><span class="s4">.</span><span class="s2">r </span><span class="s4">*</span><span class="s2"> c1</span><span class="s4">.</span><span class="s2">r </span><span class="s4">-</span><span class="s2"> a </span><span class="s4">*</span><span class="s2"> a</span><span class="s4">));</span></p>
+<p class="p3"><span class="s2"><span class="Apple-converted-space">      </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s1">const</span><span class="s2"> x2 </span><span class="s4">=</span><span class="s2"> c1</span><span class="s4">.</span><span class="s2">x </span><span class="s4">+</span><span class="s2"> a </span><span class="s4">*</span><span class="s2"> </span><span class="s4">(</span><span class="s2">dx </span><span class="s4">/</span><span class="s2"> d</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s1">const</span><span class="s2"> y2 </span><span class="s4">=</span><span class="s2"> c1</span><span class="s4">.</span><span class="s2">y </span><span class="s4">+</span><span class="s2"> a </span><span class="s4">*</span><span class="s2"> </span><span class="s4">(</span><span class="s2">dy </span><span class="s4">/</span><span class="s2"> d</span><span class="s4">);</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span>points</span><span class="s4">.</span><span class="s2">push</span><span class="s4">({</span><span class="s2"> x</span><span class="s4">:</span><span class="s2"> x2 </span><span class="s4">+</span><span class="s2"> h </span><span class="s4">*</span><span class="s2"> </span><span class="s4">(</span><span class="s2">dy </span><span class="s4">/</span><span class="s2"> d</span><span class="s4">),</span><span class="s2"> y</span><span class="s4">:</span><span class="s2"> y2 </span><span class="s4">-</span><span class="s2"> h </span><span class="s4">*</span><span class="s2"> </span><span class="s4">(</span><span class="s2">dx </span><span class="s4">/</span><span class="s2"> d</span><span class="s4">)</span><span class="s2"> </span><span class="s4">});</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span>points</span><span class="s4">.</span><span class="s2">push</span><span class="s4">({</span><span class="s2"> x</span><span class="s4">:</span><span class="s2"> x2 </span><span class="s4">-</span><span class="s2"> h </span><span class="s4">*</span><span class="s2"> </span><span class="s4">(</span><span class="s2">dy </span><span class="s4">/</span><span class="s2"> d</span><span class="s4">),</span><span class="s2"> y</span><span class="s4">:</span><span class="s2"> y2 </span><span class="s4">+</span><span class="s2"> h </span><span class="s4">*</span><span class="s2"> </span><span class="s4">(</span><span class="s2">dx </span><span class="s4">/</span><span class="s2"> d</span><span class="s4">)</span><span class="s2"> </span><span class="s4">});</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">return</span><span class="s2"> points</span><span class="s4">;</span></p>
+<p class="p5"><span class="s2">};</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p4"><span class="s2">// --- Components ---</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s1">const</span><span class="s2"> </span><span class="s3">ControlGroup</span><span class="s2"> </span><span class="s4">=</span><span class="s2"> </span><span class="s4">({</span><span class="s2"> title</span><span class="s4">,</span><span class="s2"> children</span><span class="s4">,</span><span class="s2"> icon</span><span class="s4">:</span><span class="s2"> </span><span class="s3">Icon</span><span class="s2"> </span><span class="s4">})</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> </span><span class="s4">(</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s4">&lt;</span><span class="s6">div className</span><span class="s4">=</span><span class="s2">"mb-6 border-b border-gray-800 pb-4 last:border-0"</span><span class="s4">&gt;</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">    </span></span><span class="s4">&lt;</span><span class="s6">div className</span><span class="s4">=</span><span class="s2">"flex items-center space-x-2 mb-3 text-gray-500"</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s4">{</span><span class="s3">Icon</span><span class="s2"> </span><span class="s4">&amp;&amp;</span><span class="s2"> </span><span class="s4">&lt;</span><span class="s3">Icon</span><span class="s2"> size</span><span class="s4">={</span><span class="s8">14</span><span class="s4">}</span><span class="s2"> /&gt;</span><span class="s4">}</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">      </span></span><span class="s4">&lt;</span><span class="s6">h3 className</span><span class="s4">=</span><span class="s2">"text-[10px] font-bold uppercase tracking-widest"</span><span class="s4">&gt;{</span><span class="s6">title</span><span class="s4">}&lt;/</span><span class="s6">h3</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s4">&lt;/</span><span class="s2">div</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s4">&lt;</span><span class="s2">div className</span><span class="s4">=</span><span class="s5">"space-y-3"</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s4">{</span><span class="s2">children</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s4">&lt;/</span><span class="s2">div</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s4">&lt;/</span><span class="s2">div</span><span class="s4">&gt;</span></p>
+<p class="p5"><span class="s2">);</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s1">const</span><span class="s2"> </span><span class="s3">Slider</span><span class="s2"> </span><span class="s4">=</span><span class="s2"> </span><span class="s4">({</span><span class="s2"> label</span><span class="s4">,</span><span class="s2"> value</span><span class="s4">,</span><span class="s2"> min</span><span class="s4">,</span><span class="s2"> max</span><span class="s4">,</span><span class="s2"> step</span><span class="s4">,</span><span class="s2"> onChange </span><span class="s4">})</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> </span><span class="s4">(</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s4">&lt;</span><span class="s6">div className</span><span class="s4">=</span><span class="s2">"flex flex-col space-y-1"</span><span class="s4">&gt;</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">    </span></span><span class="s4">&lt;</span><span class="s6">div className</span><span class="s4">=</span><span class="s2">"flex justify-between text-[10px] text-gray-400 font-mono uppercase"</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s4">&lt;</span><span class="s2">span</span><span class="s4">&gt;{</span><span class="s2">label</span><span class="s4">}&lt;/</span><span class="s2">span</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s4">&lt;</span><span class="s2">span</span><span class="s4">&gt;{</span><span class="s2">value</span><span class="s4">.</span><span class="s2">toFixed</span><span class="s4">(</span><span class="s8">1</span><span class="s4">)}&lt;/</span><span class="s2">span</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s4">&lt;/</span><span class="s2">div</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s4">&lt;</span><span class="s2">input</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">      </span></span><span class="s1">type</span><span class="s4">=</span><span class="s2">"range"</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span>min</span><span class="s4">={</span><span class="s2">min</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span>max</span><span class="s4">={</span><span class="s2">max</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span>step</span><span class="s4">={</span><span class="s2">step</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span>value</span><span class="s4">={</span><span class="s2">value</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span>onChange</span><span class="s4">={(</span><span class="s2">e</span><span class="s4">)</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> onChange</span><span class="s4">(</span><span class="s2">parseFloat</span><span class="s4">(</span><span class="s2">e</span><span class="s4">.</span><span class="s2">target</span><span class="s4">.</span><span class="s2">value</span><span class="s4">))}</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">      </span>className</span><span class="s4">=</span><span class="s2">"w-full h-1 bg-gray-800 rounded-lg appearance-none cursor-pointer accent-white hover:accent-gray-300 focus:outline-none focus:ring-1 focus:ring-gray-500"</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span>/&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s4">&lt;/</span><span class="s2">div</span><span class="s4">&gt;</span></p>
+<p class="p5"><span class="s2">);</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p5"><span class="s1">const</span><span class="s6"> </span><span class="s3">App</span><span class="s6"> </span><span class="s2">=</span><span class="s6"> </span><span class="s2">()</span><span class="s6"> </span><span class="s2">=&gt;</span><span class="s6"> </span><span class="s2">{</span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// --- State ---</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> </span><span class="s4">[</span><span class="s2">size</span><span class="s4">,</span><span class="s2"> setSize</span><span class="s4">]</span><span class="s2"> </span><span class="s4">=</span><span class="s2"> useState</span><span class="s4">(</span><span class="s8">800</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> </span><span class="s4">[</span><span class="s2">text</span><span class="s4">,</span><span class="s2"> setText</span><span class="s4">]</span><span class="s2"> </span><span class="s4">=</span><span class="s2"> useState</span><span class="s4">(</span><span class="s5">"ORBIT"</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> </span><span class="s4">[</span><span class="s2">fontFamily</span><span class="s4">,</span><span class="s2"> setFontFamily</span><span class="s4">]</span><span class="s2"> </span><span class="s4">=</span><span class="s2"> useState</span><span class="s4">(</span><span class="s5">"Inter, sans-serif"</span><span class="s4">);</span><span class="s2"> </span><span class="s9">// New state for font</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> </span><span class="s4">[</span><span class="s2">resolution</span><span class="s4">,</span><span class="s2"> setResolution</span><span class="s4">]</span><span class="s2"> </span><span class="s4">=</span><span class="s2"> useState</span><span class="s4">(</span><span class="s8">4</span><span class="s4">);</span><span class="s2"> </span><span class="s9">// 1 to 10</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> </span><span class="s4">[</span><span class="s2">sphereRadius</span><span class="s4">,</span><span class="s2"> setSphereRadius</span><span class="s4">]</span><span class="s2"> </span><span class="s4">=</span><span class="s2"> useState</span><span class="s4">(</span><span class="s8">30</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> </span><span class="s4">[</span><span class="s2">viewTilt</span><span class="s4">,</span><span class="s2"> setViewTilt</span><span class="s4">]</span><span class="s2"> </span><span class="s4">=</span><span class="s2"> useState</span><span class="s4">(</span><span class="s8">0</span><span class="s4">);</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p3"><span class="s2"><span class="Apple-converted-space">  </span></span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// Visual Toggles</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> </span><span class="s4">[</span><span class="s2">showSpheres</span><span class="s4">,</span><span class="s2"> setShowSpheres</span><span class="s4">]</span><span class="s2"> </span><span class="s4">=</span><span class="s2"> useState</span><span class="s4">(</span><span class="s1">true</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> </span><span class="s4">[</span><span class="s2">showConnections</span><span class="s4">,</span><span class="s2"> setShowConnections</span><span class="s4">]</span><span class="s2"> </span><span class="s4">=</span><span class="s2"> useState</span><span class="s4">(</span><span class="s1">false</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> </span><span class="s4">[</span><span class="s2">showIntersections</span><span class="s4">,</span><span class="s2"> setShowIntersections</span><span class="s4">]</span><span class="s2"> </span><span class="s4">=</span><span class="s2"> useState</span><span class="s4">(</span><span class="s1">true</span><span class="s4">);</span></p>
+<p class="p3"><span class="s2"><span class="Apple-converted-space">  </span></span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// Style Params</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> </span><span class="s4">[</span><span class="s2">connectionDist</span><span class="s4">,</span><span class="s2"> setConnectionDist</span><span class="s4">]</span><span class="s2"> </span><span class="s4">=</span><span class="s2"> useState</span><span class="s4">(</span><span class="s8">40</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> </span><span class="s4">[</span><span class="s2">opacity</span><span class="s4">,</span><span class="s2"> setOpacity</span><span class="s4">]</span><span class="s2"> </span><span class="s4">=</span><span class="s2"> useState</span><span class="s4">(</span><span class="s8">0.5</span><span class="s4">);</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> svgRef </span><span class="s4">=</span><span class="s2"> useRef</span><span class="s4">(</span><span class="s1">null</span><span class="s4">);</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// --- Derived Data ---</span></p>
+<p class="p3"><span class="s2"><span class="Apple-converted-space">  </span></span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// 1. Generate Base Points from Text</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> textPoints </span><span class="s4">=</span><span class="s2"> useMemo</span><span class="s4">(()</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">    </span></span><span class="s2">// Pass resolution and font family</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s1">return</span><span class="s2"> getTextPoints</span><span class="s4">(</span><span class="s2">text</span><span class="s4">,</span><span class="s2"> resolution</span><span class="s4">,</span><span class="s2"> fontFamily</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s4">},</span><span class="s2"> </span><span class="s4">[</span><span class="s2">text</span><span class="s4">,</span><span class="s2"> resolution</span><span class="s4">,</span><span class="s2"> fontFamily</span><span class="s4">]);</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// 2. Projection Logic</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> project </span><span class="s4">=</span><span class="s2"> </span><span class="s4">(</span><span class="s2">x</span><span class="s4">,</span><span class="s2"> y</span><span class="s4">)</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">    </span></span><span class="s1">const</span><span class="s6"> centerY </span><span class="s4">=</span><span class="s6"> </span><span class="s8">0</span><span class="s4">;</span><span class="s6"> </span><span class="s2">// Relative to center of group</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s1">const</span><span class="s2"> scaleY </span><span class="s4">=</span><span class="s2"> </span><span class="s3">Math</span><span class="s4">.</span><span class="s2">cos</span><span class="s4">(</span><span class="s2">toRad</span><span class="s4">(</span><span class="s2">viewTilt</span><span class="s4">));</span></p>
+<p class="p7"><span class="s6"><span class="Apple-converted-space">    </span></span><span class="s2">return</span><span class="s6"> </span><span class="s4">{</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span>x</span><span class="s4">:</span><span class="s2"> x</span><span class="s4">,</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span>y</span><span class="s4">:</span><span class="s2"> y </span><span class="s4">*</span><span class="s2"> scaleY</span><span class="s4">,</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span>scaleY</span><span class="s4">:</span><span class="s2"> scaleY</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s4">};</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s4">};</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">// 3. Generate Scene Data (Projected)</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> sceneData </span><span class="s4">=</span><span class="s2"> useMemo</span><span class="s4">(()</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">    </span></span><span class="s2">// Convert textPoints to circle objects</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s1">const</span><span class="s2"> circles </span><span class="s4">=</span><span class="s2"> textPoints</span><span class="s4">.</span><span class="s2">map</span><span class="s4">((</span><span class="s2">p</span><span class="s4">,</span><span class="s2"> i</span><span class="s4">)</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> </span><span class="s4">({</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span>id</span><span class="s4">:</span><span class="s2"> i</span><span class="s4">,</span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">      </span>x</span><span class="s4">:</span><span class="s6"> p</span><span class="s4">.</span><span class="s6">x</span><span class="s4">,</span><span class="s6"> </span><span class="s2">// Already centered</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span>y</span><span class="s4">:</span><span class="s2"> p</span><span class="s4">.</span><span class="s2">y</span><span class="s4">,</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span>r</span><span class="s4">:</span><span class="s2"> sphereRadius</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s4">}));</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">    </span></span><span class="s2">// Calculate Intersections (Only if needed, heavy op)</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s1">let</span><span class="s2"> intersections </span><span class="s4">=</span><span class="s2"> </span><span class="s4">[];</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s1">if</span><span class="s2"> </span><span class="s4">(</span><span class="s2">showIntersections </span><span class="s4">&amp;&amp;</span><span class="s2"> circles</span><span class="s4">.</span><span class="s2">length </span><span class="s4">&lt;</span><span class="s2"> </span><span class="s8">600</span><span class="s4">)</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span>intersections </span><span class="s4">=</span><span class="s2"> getIntersections</span><span class="s4">(</span><span class="s2">circles</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s4">}</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">    </span></span><span class="s2">// Calculate Connections (Network)</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s1">let</span><span class="s2"> connections </span><span class="s4">=</span><span class="s2"> </span><span class="s4">[];</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s1">if</span><span class="s2"> </span><span class="s4">(</span><span class="s2">showConnections</span><span class="s4">)</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">      </span></span><span class="s2">// Simple distance check</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s1">for</span><span class="s2"> </span><span class="s4">(</span><span class="s1">let</span><span class="s2"> i </span><span class="s4">=</span><span class="s2"> </span><span class="s8">0</span><span class="s4">;</span><span class="s2"> i </span><span class="s4">&lt;</span><span class="s2"> circles</span><span class="s4">.</span><span class="s2">length</span><span class="s4">;</span><span class="s2"> i</span><span class="s4">++)</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">        </span></span><span class="s2">// Optimization: check only next few? No, spatial index is best but complex.</span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">        </span></span><span class="s2">// Brute force with small limit</span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">        </span></span><span class="s1">const</span><span class="s6"> limit </span><span class="s4">=</span><span class="s6"> </span><span class="s8">50</span><span class="s4">;</span><span class="s6"> </span><span class="s2">// Check 50 neighbors max</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">        </span></span><span class="s1">for</span><span class="s2"> </span><span class="s4">(</span><span class="s1">let</span><span class="s2"> j </span><span class="s4">=</span><span class="s2"> i </span><span class="s4">+</span><span class="s2"> </span><span class="s8">1</span><span class="s4">;</span><span class="s2"> j </span><span class="s4">&lt;</span><span class="s2"> </span><span class="s3">Math</span><span class="s4">.</span><span class="s2">min</span><span class="s4">(</span><span class="s2">circles</span><span class="s4">.</span><span class="s2">length</span><span class="s4">,</span><span class="s2"> i </span><span class="s4">+</span><span class="s2"> limit</span><span class="s4">);</span><span class="s2"> j</span><span class="s4">++)</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">             </span></span><span class="s1">const</span><span class="s2"> dx </span><span class="s4">=</span><span class="s2"> circles</span><span class="s4">[</span><span class="s2">i</span><span class="s4">].</span><span class="s2">x </span><span class="s4">-</span><span class="s2"> circles</span><span class="s4">[</span><span class="s2">j</span><span class="s4">].</span><span class="s2">x</span><span class="s4">;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">             </span></span><span class="s1">const</span><span class="s2"> dy </span><span class="s4">=</span><span class="s2"> circles</span><span class="s4">[</span><span class="s2">i</span><span class="s4">].</span><span class="s2">y </span><span class="s4">-</span><span class="s2"> circles</span><span class="s4">[</span><span class="s2">j</span><span class="s4">].</span><span class="s2">y</span><span class="s4">;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">             </span></span><span class="s1">if</span><span class="s2"> </span><span class="s4">(</span><span class="s3">Math</span><span class="s4">.</span><span class="s2">abs</span><span class="s4">(</span><span class="s2">dx</span><span class="s4">)</span><span class="s2"> </span><span class="s4">&gt;</span><span class="s2"> connectionDist </span><span class="s4">||</span><span class="s2"> </span><span class="s3">Math</span><span class="s4">.</span><span class="s2">abs</span><span class="s4">(</span><span class="s2">dy</span><span class="s4">)</span><span class="s2"> </span><span class="s4">&gt;</span><span class="s2"> connectionDist</span><span class="s4">)</span><span class="s2"> </span><span class="s1">continue</span><span class="s4">;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">             </span></span><span class="s1">const</span><span class="s2"> d </span><span class="s4">=</span><span class="s2"> </span><span class="s3">Math</span><span class="s4">.</span><span class="s2">sqrt</span><span class="s4">(</span><span class="s2">dx</span><span class="s4">*</span><span class="s2">dx </span><span class="s4">+</span><span class="s2"> dy</span><span class="s4">*</span><span class="s2">dy</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">             </span></span><span class="s1">if</span><span class="s2"> </span><span class="s4">(</span><span class="s2">d </span><span class="s4">&lt;</span><span class="s2"> connectionDist</span><span class="s4">)</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">               </span>connections</span><span class="s4">.</span><span class="s2">push</span><span class="s4">({</span><span class="s2"> x1</span><span class="s4">:</span><span class="s2"> circles</span><span class="s4">[</span><span class="s2">i</span><span class="s4">].</span><span class="s2">x</span><span class="s4">,</span><span class="s2"> y1</span><span class="s4">:</span><span class="s2"> circles</span><span class="s4">[</span><span class="s2">i</span><span class="s4">].</span><span class="s2">y</span><span class="s4">,</span><span class="s2"> x2</span><span class="s4">:</span><span class="s2"> circles</span><span class="s4">[</span><span class="s2">j</span><span class="s4">].</span><span class="s2">x</span><span class="s4">,</span><span class="s2"> y2</span><span class="s4">:</span><span class="s2"> circles</span><span class="s4">[</span><span class="s2">j</span><span class="s4">].</span><span class="s2">y </span><span class="s4">});</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">             </span></span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">        </span></span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s4">}</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s1">return</span><span class="s2"> </span><span class="s4">{</span><span class="s2"> circles</span><span class="s4">,</span><span class="s2"> intersections</span><span class="s4">,</span><span class="s2"> connections </span><span class="s4">};</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s4">},</span><span class="s2"> </span><span class="s4">[</span><span class="s2">textPoints</span><span class="s4">,</span><span class="s2"> sphereRadius</span><span class="s4">,</span><span class="s2"> showIntersections</span><span class="s4">,</span><span class="s2"> showConnections</span><span class="s4">,</span><span class="s2"> connectionDist</span><span class="s4">]);</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> downloadSVG </span><span class="s4">=</span><span class="s2"> </span><span class="s4">()</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s1">if</span><span class="s2"> </span><span class="s4">(!</span><span class="s2">svgRef</span><span class="s4">.</span><span class="s2">current</span><span class="s4">)</span><span class="s2"> </span><span class="s1">return</span><span class="s4">;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s1">const</span><span class="s2"> svgData </span><span class="s4">=</span><span class="s2"> </span><span class="s1">new</span><span class="s2"> </span><span class="s3">XMLSerializer</span><span class="s4">().</span><span class="s2">serializeToString</span><span class="s4">(</span><span class="s2">svgRef</span><span class="s4">.</span><span class="s2">current</span><span class="s4">);</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">    </span></span><span class="s1">const</span><span class="s6"> blob </span><span class="s4">=</span><span class="s6"> </span><span class="s1">new</span><span class="s6"> </span><span class="s3">Blob</span><span class="s4">([</span><span class="s6">svgData</span><span class="s4">],</span><span class="s6"> </span><span class="s4">{</span><span class="s6"> </span><span class="s1">type</span><span class="s4">:</span><span class="s6"> </span><span class="s2">'image/svg+xml;charset=utf-8'</span><span class="s6"> </span><span class="s4">});</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s1">const</span><span class="s2"> url </span><span class="s4">=</span><span class="s2"> </span><span class="s3">URL</span><span class="s4">.</span><span class="s2">createObjectURL</span><span class="s4">(</span><span class="s2">blob</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s1">const</span><span class="s2"> link </span><span class="s4">=</span><span class="s2"> document</span><span class="s4">.</span><span class="s2">createElement</span><span class="s4">(</span><span class="s5">'a'</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span>link</span><span class="s4">.</span><span class="s2">href </span><span class="s4">=</span><span class="s2"> url</span><span class="s4">;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span>link</span><span class="s4">.</span><span class="s2">download </span><span class="s4">=</span><span class="s2"> </span><span class="s5">`typo-orbital-</span><span class="s4">${</span><span class="s2">text</span><span class="s4">}</span><span class="s5">.svg`</span><span class="s4">;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span>document</span><span class="s4">.</span><span class="s2">body</span><span class="s4">.</span><span class="s2">appendChild</span><span class="s4">(</span><span class="s2">link</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span>link</span><span class="s4">.</span><span class="s2">click</span><span class="s4">();</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span>document</span><span class="s4">.</span><span class="s2">body</span><span class="s4">.</span><span class="s2">removeChild</span><span class="s4">(</span><span class="s2">link</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s4">};</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s1">const</span><span class="s2"> toggleView </span><span class="s4">=</span><span class="s2"> </span><span class="s4">()</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span>setViewTilt</span><span class="s4">(</span><span class="s2">viewTilt </span><span class="s4">===</span><span class="s2"> </span><span class="s8">0</span><span class="s2"> </span><span class="s4">?</span><span class="s2"> </span><span class="s8">90</span><span class="s2"> </span><span class="s4">:</span><span class="s2"> </span><span class="s8">0</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s4">};</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p7"><span class="s6"><span class="Apple-converted-space">  </span></span><span class="s2">return</span><span class="s6"> </span><span class="s4">(</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">    </span></span><span class="s4">&lt;</span><span class="s6">div className</span><span class="s4">=</span><span class="s2">"flex flex-col md:flex-row h-screen bg-black text-gray-300 font-sans overflow-hidden"</span><span class="s4">&gt;</span></p>
+<p class="p3"><span class="s2"><span class="Apple-converted-space">      </span></span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">      </span></span><span class="s4">{</span><span class="s2">/* Sidebar */</span><span class="s4">}</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">      </span></span><span class="s4">&lt;</span><span class="s6">div className</span><span class="s4">=</span><span class="s2">"w-full md:w-80 flex flex-col bg-[#0a0a0a] border-r border-gray-800 z-10 h-1/2 md:h-full overflow-hidden"</span><span class="s4">&gt;</span></p>
+<p class="p3"><span class="s2"><span class="Apple-converted-space">        </span></span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">        </span></span><span class="s4">&lt;</span><span class="s6">div className</span><span class="s4">=</span><span class="s2">"p-5 border-b border-gray-800 bg-[#0a0a0a]"</span><span class="s4">&gt;</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">          </span></span><span class="s4">&lt;</span><span class="s6">div className</span><span class="s4">=</span><span class="s2">"flex items-center justify-between mb-1"</span><span class="s4">&gt;</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">            </span></span><span class="s4">&lt;</span><span class="s6">h1 className</span><span class="s4">=</span><span class="s2">"text-lg font-light tracking-[0.2em] text-white uppercase"</span><span class="s4">&gt;</span><span class="s3">Typo</span><span class="s4">.</span><span class="s3">Orbital</span><span class="s4">&lt;/</span><span class="s6">h1</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">            </span></span><span class="s4">&lt;</span><span class="s2">div className</span><span class="s4">=</span><span class="s5">"flex space-x-1"</span><span class="s4">&gt;</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">              </span></span><span class="s4">&lt;</span><span class="s6">button onClick</span><span class="s4">={</span><span class="s6">downloadSVG</span><span class="s4">}</span><span class="s6"> className</span><span class="s4">=</span><span class="s2">"p-2 hover:bg-gray-800 rounded transition-colors"</span><span class="s6"> title</span><span class="s4">=</span><span class="s2">"Export SVG"</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                </span></span><span class="s4">&lt;</span><span class="s3">Download</span><span class="s2"> size</span><span class="s4">={</span><span class="s8">14</span><span class="s4">}</span><span class="s2"> className</span><span class="s4">=</span><span class="s5">"text-gray-400 hover:text-white"</span><span class="s2"> /&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span></span><span class="s4">&lt;/</span><span class="s2">button</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">            </span></span><span class="s4">&lt;/</span><span class="s2">div</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">          </span></span><span class="s4">&lt;/</span><span class="s2">div</span><span class="s4">&gt;</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">          </span></span><span class="s4">&lt;</span><span class="s6">p className</span><span class="s4">=</span><span class="s2">"text-[9px] text-gray-600 font-mono uppercase tracking-widest"</span><span class="s4">&gt;</span><span class="s3">Parametric</span><span class="s6"> </span><span class="s3">Typography</span><span class="s4">&lt;/</span><span class="s6">p</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">        </span></span><span class="s4">&lt;/</span><span class="s2">div</span><span class="s4">&gt;</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">        </span></span><span class="s4">&lt;</span><span class="s6">div className</span><span class="s4">=</span><span class="s2">"flex-1 overflow-y-auto p-5 custom-scrollbar"</span><span class="s4">&gt;</span></p>
+<p class="p3"><span class="s2"><span class="Apple-converted-space">          </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">          </span></span><span class="s4">&lt;</span><span class="s3">ControlGroup</span><span class="s2"> title</span><span class="s4">=</span><span class="s5">"Input"</span><span class="s2"> icon</span><span class="s4">={</span><span class="s3">Type</span><span class="s4">}&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">            </span></span><span class="s4">&lt;</span><span class="s2">input<span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span></span><span class="s1">type</span><span class="s4">=</span><span class="s5">"text"</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>value</span><span class="s4">={</span><span class="s2">text</span><span class="s4">}</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>onChange</span><span class="s4">={(</span><span class="s2">e</span><span class="s4">)</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> setText</span><span class="s4">(</span><span class="s2">e</span><span class="s4">.</span><span class="s2">target</span><span class="s4">.</span><span class="s2">value</span><span class="s4">.</span><span class="s2">toUpperCase</span><span class="s4">())}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>maxLength</span><span class="s4">={</span><span class="s8">12</span><span class="s4">}</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">              </span>className</span><span class="s4">=</span><span class="s2">"w-full bg-gray-900 border border-gray-700 text-white text-sm p-2 rounded mb-2 font-mono text-center tracking-widest uppercase focus:outline-none focus:border-white"</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">            </span>/&gt;</span></p>
+<p class="p3"><span class="s2"><span class="Apple-converted-space">            </span></span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">            </span></span><span class="s4">{</span><span class="s2">/* Font Family Input */</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">            </span></span><span class="s4">&lt;</span><span class="s2">div className</span><span class="s4">=</span><span class="s5">"mb-4"</span><span class="s4">&gt;</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">              </span></span><span class="s4">&lt;</span><span class="s6">label className</span><span class="s4">=</span><span class="s2">"text-[10px] text-gray-500 font-mono uppercase block mb-1"</span><span class="s4">&gt;</span><span class="s3">Typeface</span><span class="s4">&lt;/</span><span class="s6">label</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span></span><span class="s4">&lt;</span><span class="s2">input<span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                </span></span><span class="s1">type</span><span class="s4">=</span><span class="s5">"text"</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                </span>value</span><span class="s4">={</span><span class="s2">fontFamily</span><span class="s4">}</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                </span>onChange</span><span class="s4">={(</span><span class="s2">e</span><span class="s4">)</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> setFontFamily</span><span class="s4">(</span><span class="s2">e</span><span class="s4">.</span><span class="s2">target</span><span class="s4">.</span><span class="s2">value</span><span class="s4">)}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                </span>placeholder</span><span class="s4">=</span><span class="s5">"e.g. Arial, Helvetica"</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">                </span>className</span><span class="s4">=</span><span class="s2">"w-full bg-gray-900 border border-gray-700 text-white text-xs p-2 rounded focus:outline-none focus:border-white placeholder-gray-600"</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>/&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">            </span></span><span class="s4">&lt;/</span><span class="s2">div</span><span class="s4">&gt;</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">            </span></span><span class="s4">&lt;</span><span class="s3">Slider</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>label</span><span class="s4">=</span><span class="s5">"Sampling Density"</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>value</span><span class="s4">={</span><span class="s2">resolution</span><span class="s4">}</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>min</span><span class="s4">={</span><span class="s8">1</span><span class="s4">}</span><span class="s2"> max</span><span class="s4">={</span><span class="s8">8</span><span class="s4">}</span><span class="s2"> step</span><span class="s4">={</span><span class="s8">0.5</span><span class="s4">}</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>onChange</span><span class="s4">={</span><span class="s2">setResolution</span><span class="s4">}</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">            </span>/&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">            </span></span><span class="s4">&lt;</span><span class="s2">div className</span><span class="s4">=</span><span class="s5">"text-[9px] text-gray-600 text-right pt-1"</span><span class="s4">&gt;</span><span class="s3">Points</span><span class="s4">:</span><span class="s2"> </span><span class="s4">{</span><span class="s2">textPoints</span><span class="s4">.</span><span class="s2">length</span><span class="s4">}&lt;/</span><span class="s2">div</span><span class="s4">&gt;</span></p>
+<p class="p2"><span class="s6"><span class="Apple-converted-space">          </span></span><span class="s4">&lt;/</span><span class="s2">ControlGroup</span><span class="s4">&gt;</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">          </span></span><span class="s4">&lt;</span><span class="s3">ControlGroup</span><span class="s2"> title</span><span class="s4">=</span><span class="s5">"Structure"</span><span class="s2"> icon</span><span class="s4">={</span><span class="s3">Sliders</span><span class="s4">}&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">             </span></span><span class="s4">&lt;</span><span class="s3">Slider</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>label</span><span class="s4">=</span><span class="s5">"Sphere Radius"</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>value</span><span class="s4">={</span><span class="s2">sphereRadius</span><span class="s4">}</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>min</span><span class="s4">={</span><span class="s8">5</span><span class="s4">}</span><span class="s2"> max</span><span class="s4">={</span><span class="s8">100</span><span class="s4">}</span><span class="s2"> step</span><span class="s4">={</span><span class="s8">1</span><span class="s4">}</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>onChange</span><span class="s4">={</span><span class="s2">setSphereRadius</span><span class="s4">}</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">            </span>/&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">             </span></span><span class="s4">&lt;</span><span class="s3">Slider</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>label</span><span class="s4">=</span><span class="s5">"Opacity"</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>value</span><span class="s4">={</span><span class="s2">opacity</span><span class="s4">}</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>min</span><span class="s4">={</span><span class="s8">0.1</span><span class="s4">}</span><span class="s2"> max</span><span class="s4">={</span><span class="s8">1</span><span class="s4">}</span><span class="s2"> step</span><span class="s4">={</span><span class="s8">0.1</span><span class="s4">}</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>onChange</span><span class="s4">={</span><span class="s2">setOpacity</span><span class="s4">}</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">            </span>/&gt;</span></p>
+<p class="p2"><span class="s6"><span class="Apple-converted-space">          </span></span><span class="s4">&lt;/</span><span class="s2">ControlGroup</span><span class="s4">&gt;</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">          </span></span><span class="s4">&lt;</span><span class="s3">ControlGroup</span><span class="s2"> title</span><span class="s4">=</span><span class="s5">"Connections"</span><span class="s2"> icon</span><span class="s4">={</span><span class="s3">Share2</span><span class="s4">}&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">             </span></span><span class="s4">&lt;</span><span class="s2">div className</span><span class="s4">=</span><span class="s5">"flex space-x-2 mb-3"</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">               </span></span><span class="s4">&lt;</span><span class="s2">button<span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                </span>onClick</span><span class="s4">={()</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> setShowConnections</span><span class="s4">(!</span><span class="s2">showConnections</span><span class="s4">)}</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">                </span>className</span><span class="s4">={</span><span class="s2">`flex-1 py-1 text-[10px] uppercase font-bold border rounded </span><span class="s4">${</span><span class="s6">showConnections </span><span class="s4">?</span><span class="s6"> </span><span class="s2">'bg-white text-black border-white'</span><span class="s6"> </span><span class="s4">:</span><span class="s6"> </span><span class="s2">'border-gray-700 text-gray-500'</span><span class="s4">}</span><span class="s2">`</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">               </span></span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                 </span></span><span class="s3">Lines</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">               </span></span><span class="s4">&lt;/</span><span class="s2">button</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">               </span></span><span class="s4">&lt;</span><span class="s2">button<span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                </span>onClick</span><span class="s4">={()</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> setShowIntersections</span><span class="s4">(!</span><span class="s2">showIntersections</span><span class="s4">)}</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">                </span>className</span><span class="s4">={</span><span class="s2">`flex-1 py-1 text-[10px] uppercase font-bold border rounded </span><span class="s4">${</span><span class="s6">showIntersections </span><span class="s4">?</span><span class="s6"> </span><span class="s2">'bg-white text-black border-white'</span><span class="s6"> </span><span class="s4">:</span><span class="s6"> </span><span class="s2">'border-gray-700 text-gray-500'</span><span class="s4">}</span><span class="s2">`</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">               </span></span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                 </span></span><span class="s3">Intersects</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">               </span></span><span class="s4">&lt;/</span><span class="s2">button</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">             </span></span><span class="s4">&lt;/</span><span class="s2">div</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">             </span></span><span class="s4">{</span><span class="s2">showConnections </span><span class="s4">&amp;&amp;</span><span class="s2"> </span><span class="s4">(</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">               </span></span><span class="s4">&lt;</span><span class="s3">Slider</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                </span>label</span><span class="s4">=</span><span class="s5">"Link Distance"</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                </span>value</span><span class="s4">={</span><span class="s2">connectionDist</span><span class="s4">}</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                </span>min</span><span class="s4">={</span><span class="s8">10</span><span class="s4">}</span><span class="s2"> max</span><span class="s4">={</span><span class="s8">100</span><span class="s4">}</span><span class="s2"> step</span><span class="s4">={</span><span class="s8">1</span><span class="s4">}</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                </span>onChange</span><span class="s4">={</span><span class="s2">setConnectionDist</span><span class="s4">}</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>/&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">             </span></span><span class="s4">)}</span></p>
+<p class="p2"><span class="s6"><span class="Apple-converted-space">          </span></span><span class="s4">&lt;/</span><span class="s2">ControlGroup</span><span class="s4">&gt;</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">          </span></span><span class="s4">&lt;</span><span class="s3">ControlGroup</span><span class="s2"> title</span><span class="s4">=</span><span class="s5">"View"</span><span class="s2"> icon</span><span class="s4">={</span><span class="s3">Monitor</span><span class="s4">}&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">             </span></span><span class="s4">&lt;</span><span class="s2">button<span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                 </span>onClick</span><span class="s4">={</span><span class="s2">toggleView</span><span class="s4">}</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">                 </span>className</span><span class="s4">=</span><span class="s2">"flex items-center space-x-2 text-[10px] uppercase font-bold bg-gray-800 hover:bg-gray-700 px-3 py-2 rounded w-full justify-center transition-colors mb-3"</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">               </span></span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                 </span></span><span class="s4">{</span><span class="s2">viewTilt </span><span class="s4">===</span><span class="s2"> </span><span class="s8">0</span><span class="s2"> </span><span class="s4">?</span><span class="s2"> </span><span class="s4">&lt;</span><span class="s3">Box</span><span class="s2"> size</span><span class="s4">={</span><span class="s8">12</span><span class="s4">}</span><span class="s2">/&gt; </span><span class="s4">:</span><span class="s2"> </span><span class="s4">&lt;</span><span class="s3">Activity</span><span class="s2"> size</span><span class="s4">={</span><span class="s8">12</span><span class="s4">}</span><span class="s2">/&gt;</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                 </span></span><span class="s4">&lt;</span><span class="s2">span</span><span class="s4">&gt;{</span><span class="s2">viewTilt </span><span class="s4">===</span><span class="s2"> </span><span class="s8">0</span><span class="s2"> </span><span class="s4">?</span><span class="s2"> </span><span class="s5">"Switch to Lateral"</span><span class="s2"> </span><span class="s4">:</span><span class="s2"> </span><span class="s5">"Switch to Front"</span><span class="s4">}&lt;/</span><span class="s2">span</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">               </span></span><span class="s4">&lt;/</span><span class="s2">button</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">             </span></span><span class="s4">&lt;</span><span class="s3">Slider</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>label</span><span class="s4">=</span><span class="s5">"Tilt Angle"</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>value</span><span class="s4">={</span><span class="s2">viewTilt</span><span class="s4">}</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>min</span><span class="s4">={</span><span class="s8">0</span><span class="s4">}</span><span class="s2"> max</span><span class="s4">={</span><span class="s8">90</span><span class="s4">}</span><span class="s2"> step</span><span class="s4">={</span><span class="s8">1</span><span class="s4">}</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span>onChange</span><span class="s4">={</span><span class="s2">setViewTilt</span><span class="s4">}</span><span class="s2"><span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">            </span>/&gt;</span></p>
+<p class="p2"><span class="s6"><span class="Apple-converted-space">          </span></span><span class="s4">&lt;/</span><span class="s2">ControlGroup</span><span class="s4">&gt;</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">        </span></span><span class="s4">&lt;/</span><span class="s2">div</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s4">&lt;/</span><span class="s2">div</span><span class="s4">&gt;</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">      </span></span><span class="s4">{</span><span class="s2">/* Main Canvas */</span><span class="s4">}</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">      </span></span><span class="s4">&lt;</span><span class="s6">div className</span><span class="s4">=</span><span class="s2">"flex-1 bg-black relative flex items-center justify-center p-4 md:p-10 h-1/2 md:h-full overflow-hidden"</span><span class="s4">&gt;</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">        </span></span><span class="s4">&lt;</span><span class="s6">div className</span><span class="s4">=</span><span class="s2">"relative shadow-2xl bg-black border border-gray-900"</span><span class="s6"> style</span><span class="s4">={{</span><span class="s6"> width</span><span class="s4">:</span><span class="s6"> </span><span class="s2">'min(100%, 650px)'</span><span class="s4">,</span><span class="s6"> aspectRatio</span><span class="s4">:</span><span class="s6"> </span><span class="s2">'1/1'</span><span class="s6"> </span><span class="s4">}}&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">          </span></span><span class="s4">&lt;</span><span class="s2">svg</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">            </span>ref</span><span class="s4">={</span><span class="s2">svgRef</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">            </span>viewBox</span><span class="s4">={</span><span class="s5">`0 0 </span><span class="s4">${</span><span class="s2">size</span><span class="s4">}</span><span class="s5"> </span><span class="s4">${</span><span class="s2">size</span><span class="s4">}</span><span class="s5">`</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">            </span>className</span><span class="s4">=</span><span class="s5">"w-full h-full"</span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">            </span>xmlns</span><span class="s4">=</span><span class="s2">"http://www.w3.org/2000/svg"</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">          </span></span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">            </span></span><span class="s4">&lt;</span><span class="s2">rect width</span><span class="s4">={</span><span class="s2">size</span><span class="s4">}</span><span class="s2"> height</span><span class="s4">={</span><span class="s2">size</span><span class="s4">}</span><span class="s2"> fill</span><span class="s4">=</span><span class="s5">"black"</span><span class="s2"> /&gt;</span></p>
+<p class="p3"><span class="s2"><span class="Apple-converted-space">            </span></span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">            </span></span><span class="s4">{</span><span class="s2">/* Center Group */</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">            </span></span><span class="s4">&lt;</span><span class="s2">g transform</span><span class="s4">={</span><span class="s5">`translate(</span><span class="s4">${</span><span class="s2">size</span><span class="s4">/</span><span class="s8">2</span><span class="s4">}</span><span class="s5">, </span><span class="s4">${</span><span class="s2">size</span><span class="s4">/</span><span class="s8">2</span><span class="s4">}</span><span class="s5">)`</span><span class="s4">}&gt;</span></p>
+<p class="p3"><span class="s2"><span class="Apple-converted-space">              </span></span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">              </span></span><span class="s4">{</span><span class="s2">/* 1. Connections (Lines) */</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span></span><span class="s4">{</span><span class="s2">showConnections </span><span class="s4">&amp;&amp;</span><span class="s2"> sceneData</span><span class="s4">.</span><span class="s2">connections</span><span class="s4">.</span><span class="s2">map</span><span class="s4">((</span><span class="s2">line</span><span class="s4">,</span><span class="s2"> i</span><span class="s4">)</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                </span></span><span class="s1">const</span><span class="s2"> p1 </span><span class="s4">=</span><span class="s2"> project</span><span class="s4">(</span><span class="s2">line</span><span class="s4">.</span><span class="s2">x1</span><span class="s4">,</span><span class="s2"> line</span><span class="s4">.</span><span class="s2">y1</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                </span></span><span class="s1">const</span><span class="s2"> p2 </span><span class="s4">=</span><span class="s2"> project</span><span class="s4">(</span><span class="s2">line</span><span class="s4">.</span><span class="s2">x2</span><span class="s4">,</span><span class="s2"> line</span><span class="s4">.</span><span class="s2">y2</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                </span></span><span class="s1">return</span><span class="s2"> </span><span class="s4">(</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                  </span></span><span class="s4">&lt;</span><span class="s2">line<span class="Apple-converted-space"> </span></span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>key</span><span class="s4">={</span><span class="s5">`l-</span><span class="s4">${</span><span class="s2">i</span><span class="s4">}</span><span class="s5">`</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>x1</span><span class="s4">={</span><span class="s2">p1</span><span class="s4">.</span><span class="s2">x</span><span class="s4">}</span><span class="s2"> y1</span><span class="s4">={</span><span class="s2">p1</span><span class="s4">.</span><span class="s2">y</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>x2</span><span class="s4">={</span><span class="s2">p2</span><span class="s4">.</span><span class="s2">x</span><span class="s4">}</span><span class="s2"> y2</span><span class="s4">={</span><span class="s2">p2</span><span class="s4">.</span><span class="s2">y</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>stroke</span><span class="s4">=</span><span class="s5">"white"</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>strokeWidth</span><span class="s4">={</span><span class="s8">0.5</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>opacity</span><span class="s4">={</span><span class="s8">0.3</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                  </span>/&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                </span></span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span></span><span class="s4">})}</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">              </span></span><span class="s4">{</span><span class="s2">/* 2. Spheres (Ellipses when tilted) */</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span></span><span class="s4">{</span><span class="s2">showSpheres </span><span class="s4">&amp;&amp;</span><span class="s2"> sceneData</span><span class="s4">.</span><span class="s2">circles</span><span class="s4">.</span><span class="s2">map</span><span class="s4">((</span><span class="s2">c</span><span class="s4">)</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                </span></span><span class="s1">const</span><span class="s2"> p </span><span class="s4">=</span><span class="s2"> project</span><span class="s4">(</span><span class="s2">c</span><span class="s4">.</span><span class="s2">x</span><span class="s4">,</span><span class="s2"> c</span><span class="s4">.</span><span class="s2">y</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                </span></span><span class="s1">return</span><span class="s2"> </span><span class="s4">(</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                  </span></span><span class="s4">&lt;</span><span class="s2">ellipse</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>key</span><span class="s4">={</span><span class="s5">`c-</span><span class="s4">${</span><span class="s2">c</span><span class="s4">.</span><span class="s2">id</span><span class="s4">}</span><span class="s5">`</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>cx</span><span class="s4">={</span><span class="s2">p</span><span class="s4">.</span><span class="s2">x</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>cy</span><span class="s4">={</span><span class="s2">p</span><span class="s4">.</span><span class="s2">y</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>rx</span><span class="s4">={</span><span class="s2">c</span><span class="s4">.</span><span class="s2">r</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>ry</span><span class="s4">={</span><span class="s2">c</span><span class="s4">.</span><span class="s2">r </span><span class="s4">*</span><span class="s2"> p</span><span class="s4">.</span><span class="s2">scaleY</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>fill</span><span class="s4">=</span><span class="s5">"none"</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>stroke</span><span class="s4">=</span><span class="s5">"white"</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>strokeWidth</span><span class="s4">={</span><span class="s8">0.5</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>opacity</span><span class="s4">={</span><span class="s2">opacity</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                  </span>/&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                </span></span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span></span><span class="s4">})}</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">              </span></span><span class="s4">{</span><span class="s2">/* 3. Intersection Dots */</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span></span><span class="s4">{</span><span class="s2">showIntersections </span><span class="s4">&amp;&amp;</span><span class="s2"> sceneData</span><span class="s4">.</span><span class="s2">intersections</span><span class="s4">.</span><span class="s2">map</span><span class="s4">((</span><span class="s2">pt</span><span class="s4">,</span><span class="s2"> i</span><span class="s4">)</span><span class="s2"> </span><span class="s4">=&gt;</span><span class="s2"> </span><span class="s4">{</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                 </span></span><span class="s1">const</span><span class="s2"> p </span><span class="s4">=</span><span class="s2"> project</span><span class="s4">(</span><span class="s2">pt</span><span class="s4">.</span><span class="s2">x</span><span class="s4">,</span><span class="s2"> pt</span><span class="s4">.</span><span class="s2">y</span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                 </span></span><span class="s1">return</span><span class="s2"> </span><span class="s4">(</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                   </span></span><span class="s4">&lt;</span><span class="s2">circle</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>key</span><span class="s4">={</span><span class="s5">`i-</span><span class="s4">${</span><span class="s2">i</span><span class="s4">}</span><span class="s5">`</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>cx</span><span class="s4">={</span><span class="s2">p</span><span class="s4">.</span><span class="s2">x</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>cy</span><span class="s4">={</span><span class="s2">p</span><span class="s4">.</span><span class="s2">y</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>r</span><span class="s4">={</span><span class="s8">1.5</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>fill</span><span class="s4">=</span><span class="s5">"white"</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                    </span>opacity</span><span class="s4">={</span><span class="s8">0.8</span><span class="s4">}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                   </span>/&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">                 </span></span><span class="s4">);</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">              </span></span><span class="s4">})}</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">            </span></span><span class="s4">&lt;/</span><span class="s2">g</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">          </span></span><span class="s4">&lt;/</span><span class="s2">svg</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">        </span></span><span class="s4">&lt;/</span><span class="s2">div</span><span class="s4">&gt;</span></p>
+<p class="p3"><span class="s2"><span class="Apple-converted-space">        </span></span></p>
+<p class="p6"><span class="s6"><span class="Apple-converted-space">        </span></span><span class="s4">&lt;</span><span class="s6">div className</span><span class="s4">=</span><span class="s2">"absolute bottom-6 left-10 text-[10px] text-gray-600 uppercase tracking-widest pointer-events-none"</span><span class="s4">&gt;</span></p>
+<p class="p4"><span class="s6"><span class="Apple-converted-space">          </span></span><span class="s4">{</span><span class="s6">text</span><span class="s4">}</span><span class="s6"> </span><span class="s2">// {resolution} // {sphereRadius}</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">        </span></span><span class="s4">&lt;/</span><span class="s2">div</span><span class="s4">&gt;</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">      </span></span><span class="s4">&lt;/</span><span class="s2">div</span><span class="s4">&gt;</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">    </span></span><span class="s4">&lt;/</span><span class="s2">div</span><span class="s4">&gt;</span></p>
+<p class="p1"><span class="s2"><span class="Apple-converted-space">  </span></span><span class="s4">);</span></p>
+<p class="p5"><span class="s2">};</span></p>
+<p class="p3"><span class="s7"></span><br></p>
+<p class="p7"><span class="s2">export</span><span class="s6"> </span><span class="s2">default</span><span class="s6"> </span><span class="s3">App</span><span class="s4">;</span></p>
+</body>
+</html>
